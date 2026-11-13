@@ -7,8 +7,10 @@ using Altinn.Authorization.ABAC.Xacml.JsonProfile;
 using Altinn.Common.PEP.Authorization;
 using Altinn.Common.PEP.Configuration;
 using Altinn.Common.PEP.Interfaces;
+using Altinn.Common.PEP.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -18,6 +20,9 @@ namespace Altinn.Authorization.PEP.Tests
     [UnitTest]
     public class AppAccessHandlerTest
     {
+        private const string InstanceOwnerPartyId = "1000";
+        private static readonly Guid InstanceGuid = Guid.Parse("0f8b3f8c-9d0e-4bb4-a6a4-1a2b3c4d5e6f");
+
         private readonly Mock<IHttpContextAccessor> _httpContextAccessorMock;
         private readonly Mock<IPDP> _pdpMock;
         private readonly IOptions<PepSettings> _generalSettings;
@@ -252,6 +257,234 @@ namespace Altinn.Authorization.PEP.Tests
             // Assert
             Assert.True(context.HasSucceeded);
             Assert.False(context.HasFailed);
+        }
+
+        /// <summary>
+        /// Test case: The host has registered an instance context provider that knows the current task
+        /// Expected: The provider gets the instance from the route, and the task is sent to the PDP
+        /// </summary>
+        [Fact]
+        public async Task HandleRequirementAsync_InstanceContextProviderReturnsTask_SendsTaskToPdp()
+        {
+            // Arrange
+            AuthorizationHandlerContext context = CreateAuthorizationHandlerContext();
+            Mock<IInstanceContextProvider> providerMock = new Mock<IInstanceContextProvider>();
+            providerMock
+                .Setup(p => p.GetInstanceContext(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new InstanceContext(1000, "myOrg/myApp", "Task_1", null));
+            using CancellationTokenSource cts = new CancellationTokenSource();
+            HttpContext httpContext = CreateHttpContextWithInstance(InstanceOwnerPartyId, InstanceGuid.ToString(), providerMock.Object);
+            httpContext.RequestAborted = cts.Token;
+            _httpContextAccessorMock.Setup(h => h.HttpContext).Returns(httpContext);
+            _pdpMock.Setup(a => a.GetDecisionForRequest(It.IsAny<XacmlJsonRequestRoot>(), It.IsAny<CancellationToken>())).ReturnsAsync(CreateResponse(XacmlContextDecision.Permit.ToString()));
+
+            // Act
+            await _aah.HandleAsync(context);
+
+            // Assert
+            Assert.True(context.HasSucceeded);
+            providerMock.Verify(p => p.GetInstanceContext("myOrg", "myApp", 1000, InstanceGuid, cts.Token), Times.Once);
+            XacmlJsonCategory resource = GetSentResource();
+            Assert.Equal("Task_1", Assert.Single(resource.Attribute, a => a.AttributeId == "urn:altinn:task").Value);
+            Assert.DoesNotContain(resource.Attribute, a => a.AttributeId == "urn:altinn:end-event");
+        }
+
+        /// <summary>
+        /// Test case: The host has registered an instance context provider, and the process has ended
+        /// Expected: The end event is sent to the PDP
+        /// </summary>
+        [Fact]
+        public async Task HandleRequirementAsync_InstanceContextProviderReturnsEndEvent_SendsEndEventToPdp()
+        {
+            // Arrange
+            AuthorizationHandlerContext context = CreateAuthorizationHandlerContext();
+            Mock<IInstanceContextProvider> providerMock = new Mock<IInstanceContextProvider>();
+            providerMock
+                .Setup(p => p.GetInstanceContext(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new InstanceContext(1000, "myOrg/myApp", null, "EndEvent_1"));
+            _httpContextAccessorMock.Setup(h => h.HttpContext).Returns(CreateHttpContextWithInstance(InstanceOwnerPartyId, InstanceGuid.ToString(), providerMock.Object));
+            _pdpMock.Setup(a => a.GetDecisionForRequest(It.IsAny<XacmlJsonRequestRoot>(), It.IsAny<CancellationToken>())).ReturnsAsync(CreateResponse(XacmlContextDecision.Permit.ToString()));
+
+            // Act
+            await _aah.HandleAsync(context);
+
+            // Assert
+            Assert.True(context.HasSucceeded);
+            XacmlJsonCategory resource = GetSentResource();
+            Assert.Equal("EndEvent_1", Assert.Single(resource.Attribute, a => a.AttributeId == "urn:altinn:end-event").Value);
+            Assert.DoesNotContain(resource.Attribute, a => a.AttributeId == "urn:altinn:task");
+        }
+
+        /// <summary>
+        /// Test case: The instance context provider knows nothing about the instance
+        /// Expected: The request is sent as without a provider, so the PDP looks the instance up itself
+        /// </summary>
+        [Fact]
+        public async Task HandleRequirementAsync_InstanceContextProviderReturnsNull_SendsNoTaskOrEndEvent()
+        {
+            // Arrange
+            AuthorizationHandlerContext context = CreateAuthorizationHandlerContext();
+            Mock<IInstanceContextProvider> providerMock = new Mock<IInstanceContextProvider>();
+            providerMock
+                .Setup(p => p.GetInstanceContext(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((InstanceContext)null);
+            _httpContextAccessorMock.Setup(h => h.HttpContext).Returns(CreateHttpContextWithInstance(InstanceOwnerPartyId, InstanceGuid.ToString(), providerMock.Object));
+            _pdpMock.Setup(a => a.GetDecisionForRequest(It.IsAny<XacmlJsonRequestRoot>(), It.IsAny<CancellationToken>())).ReturnsAsync(CreateResponse(XacmlContextDecision.Permit.ToString()));
+
+            // Act
+            await _aah.HandleAsync(context);
+
+            // Assert
+            Assert.True(context.HasSucceeded);
+            providerMock.Verify(p => p.GetInstanceContext(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
+            AssertNoTaskOrEndEvent(GetSentResource());
+        }
+
+        /// <summary>
+        /// Test case: The instance the provider read belongs to another party or another app than the route says
+        /// Expected: No task or end event is sent, so the PDP looks the instance up itself and denies as before
+        /// </summary>
+        [Theory]
+        [InlineData(1001, "myOrg/myApp")]
+        [InlineData(1000, "myOrg/otherApp")]
+        [InlineData(1000, "otherOrg/myApp")]
+        [InlineData(1000, "MYORG/myApp")]
+        public async Task HandleRequirementAsync_InstanceBelongsToAnotherPartyOrApp_SendsNoTaskOrEndEvent(int instanceOwnerPartyId, string appId)
+        {
+            // Arrange
+            AuthorizationHandlerContext context = CreateAuthorizationHandlerContext();
+            Mock<IInstanceContextProvider> providerMock = new Mock<IInstanceContextProvider>();
+            providerMock
+                .Setup(p => p.GetInstanceContext(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new InstanceContext(instanceOwnerPartyId, appId, "Task_1", null));
+            _httpContextAccessorMock.Setup(h => h.HttpContext).Returns(CreateHttpContextWithInstance(InstanceOwnerPartyId, InstanceGuid.ToString(), providerMock.Object));
+            _pdpMock.Setup(a => a.GetDecisionForRequest(It.IsAny<XacmlJsonRequestRoot>(), It.IsAny<CancellationToken>())).ReturnsAsync(CreateResponse(XacmlContextDecision.Deny.ToString()));
+
+            // Act
+            await _aah.HandleAsync(context);
+
+            // Assert
+            Assert.True(context.HasFailed);
+            AssertNoTaskOrEndEvent(GetSentResource());
+        }
+
+        /// <summary>
+        /// Test case: The route has an instance, but no org or app
+        /// Expected: The provider is not asked, since the instance cannot be checked against the app
+        /// </summary>
+        [Theory]
+        [InlineData("org")]
+        [InlineData("app")]
+        public async Task HandleRequirementAsync_RouteWithoutOrgOrApp_DoesNotCallInstanceContextProvider(string missing)
+        {
+            // Arrange
+            AuthorizationHandlerContext context = CreateAuthorizationHandlerContext();
+            Mock<IInstanceContextProvider> providerMock = new Mock<IInstanceContextProvider>();
+            HttpContext httpContext = CreateHttpContextWithInstance(InstanceOwnerPartyId, InstanceGuid.ToString(), providerMock.Object);
+            httpContext.Request.RouteValues.Remove(missing);
+            _httpContextAccessorMock.Setup(h => h.HttpContext).Returns(httpContext);
+            _pdpMock.Setup(a => a.GetDecisionForRequest(It.IsAny<XacmlJsonRequestRoot>(), It.IsAny<CancellationToken>())).ReturnsAsync(CreateResponse(XacmlContextDecision.Permit.ToString()));
+
+            // Act
+            await _aah.HandleAsync(context);
+
+            // Assert
+            providerMock.VerifyNoOtherCalls();
+            AssertNoTaskOrEndEvent(GetSentResource());
+        }
+
+        /// <summary>
+        /// Test case: The host has a service provider, but no instance context provider in it
+        /// Expected: The request is sent as before
+        /// </summary>
+        [Fact]
+        public async Task HandleRequirementAsync_NoInstanceContextProvider_SendsNoTaskOrEndEvent()
+        {
+            // Arrange
+            AuthorizationHandlerContext context = CreateAuthorizationHandlerContext();
+            _httpContextAccessorMock.Setup(h => h.HttpContext).Returns(CreateHttpContextWithInstance(InstanceOwnerPartyId, InstanceGuid.ToString(), null));
+            _pdpMock.Setup(a => a.GetDecisionForRequest(It.IsAny<XacmlJsonRequestRoot>(), It.IsAny<CancellationToken>())).ReturnsAsync(CreateResponse(XacmlContextDecision.Permit.ToString()));
+
+            // Act
+            await _aah.HandleAsync(context);
+
+            // Assert
+            Assert.True(context.HasSucceeded);
+            AssertNoTaskOrEndEvent(GetSentResource());
+        }
+
+        /// <summary>
+        /// Test case: The route does not identify an instance, as when a new instance is created
+        /// Expected: The provider is not asked, and the request is sent as before
+        /// </summary>
+        [Theory]
+        [InlineData(null, null)]
+        [InlineData(InstanceOwnerPartyId, null)]
+        [InlineData("notANumber", "0f8b3f8c-9d0e-4bb4-a6a4-1a2b3c4d5e6f")]
+        [InlineData(InstanceOwnerPartyId, "notAGuid")]
+        public async Task HandleRequirementAsync_RouteWithoutInstance_DoesNotCallInstanceContextProvider(string instanceOwnerPartyId, string instanceGuid)
+        {
+            // Arrange
+            AuthorizationHandlerContext context = CreateAuthorizationHandlerContext();
+            Mock<IInstanceContextProvider> providerMock = new Mock<IInstanceContextProvider>();
+            _httpContextAccessorMock.Setup(h => h.HttpContext).Returns(CreateHttpContextWithInstance(instanceOwnerPartyId, instanceGuid, providerMock.Object));
+            _pdpMock.Setup(a => a.GetDecisionForRequest(It.IsAny<XacmlJsonRequestRoot>(), It.IsAny<CancellationToken>())).ReturnsAsync(CreateResponse(XacmlContextDecision.Permit.ToString()));
+
+            // Act
+            await _aah.HandleAsync(context);
+
+            // Assert
+            Assert.True(context.HasSucceeded);
+            providerMock.VerifyNoOtherCalls();
+            AssertNoTaskOrEndEvent(GetSentResource());
+        }
+
+        /// <summary>
+        /// Test case: The instance context provider fails
+        /// Expected: The exception is not swallowed, and no decision is requested without the task
+        /// </summary>
+        [Fact]
+        public async Task HandleRequirementAsync_InstanceContextProviderThrows_ThrowsWithoutCallingPdp()
+        {
+            // Arrange
+            AuthorizationHandlerContext context = CreateAuthorizationHandlerContext();
+            Mock<IInstanceContextProvider> providerMock = new Mock<IInstanceContextProvider>();
+            providerMock
+                .Setup(p => p.GetInstanceContext(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new HttpRequestException("Storage is unavailable"));
+            _httpContextAccessorMock.Setup(h => h.HttpContext).Returns(CreateHttpContextWithInstance(InstanceOwnerPartyId, InstanceGuid.ToString(), providerMock.Object));
+
+            // Act & Assert
+            await Assert.ThrowsAsync<HttpRequestException>(() => _aah.HandleAsync(context));
+            _pdpMock.VerifyNoOtherCalls();
+        }
+
+        private static HttpContext CreateHttpContextWithInstance(string instanceOwnerPartyId, string instanceGuid, IInstanceContextProvider provider)
+        {
+            ServiceCollection services = new ServiceCollection();
+            if (provider != null)
+            {
+                services.AddSingleton(provider);
+            }
+
+            HttpContext httpContext = new DefaultHttpContext { RequestServices = services.BuildServiceProvider() };
+            httpContext.Request.RouteValues.Add("org", "myOrg");
+            httpContext.Request.RouteValues.Add("app", "myApp");
+            httpContext.Request.RouteValues.Add("instanceOwnerPartyId", instanceOwnerPartyId);
+            httpContext.Request.RouteValues.Add("instanceGuid", instanceGuid);
+
+            return httpContext;
+        }
+
+        private XacmlJsonCategory GetSentResource()
+        {
+            XacmlJsonRequestRoot request = Assert.IsType<XacmlJsonRequestRoot>(Assert.Single(_pdpMock.Invocations).Arguments[0]);
+            return Assert.Single(request.Request.Resource);
+        }
+
+        private static void AssertNoTaskOrEndEvent(XacmlJsonCategory resource)
+        {
+            Assert.DoesNotContain(resource.Attribute, a => a.AttributeId == "urn:altinn:task" || a.AttributeId == "urn:altinn:end-event");
         }
 
         private ClaimsPrincipal CreateUser()

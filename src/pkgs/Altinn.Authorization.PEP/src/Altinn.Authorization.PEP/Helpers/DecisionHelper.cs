@@ -44,6 +44,11 @@ namespace Altinn.Common.PEP.Helpers
         private const int SystemUserAuthenticationLevel = 3;
 
         /// <summary>
+        /// The org, app and instance identifiers in the route of a request to an app.
+        /// </summary>
+        internal sealed record AppRouteValues(string Org, string App, string InstanceOwnerPartyId, string InstanceGuid);
+
+        /// <summary>
         /// Create decision request based for policy decision point.
         /// </summary>
         /// <param name="org">Unique identifier of the organisation responsible for the app.</param>
@@ -129,11 +134,52 @@ namespace Altinn.Common.PEP.Helpers
         /// <returns>A decision request</returns>
         public static XacmlJsonRequestRoot CreateDecisionRequest(AuthorizationHandlerContext context, AppAccessRequirement requirement, RouteData routeData)
         {
+            return CreateDecisionRequest(context, requirement, routeData, null);
+        }
+
+        /// <summary>
+        /// Create a new <see cref="XacmlJsonRequestRoot"/> to represent a decision request, with the current task or
+        /// end event of the instance on the resource.
+        /// </summary>
+        /// <param name="context">The current <see cref="AuthorizationHandlerContext"/></param>
+        /// <param name="requirement">The access requirements</param>
+        /// <param name="routeData">The route data from a request.</param>
+        /// <param name="instanceContext">The process state of the instance, or null to let the PDP look it up.</param>
+        /// <returns>A decision request</returns>
+        public static XacmlJsonRequestRoot CreateDecisionRequest(AuthorizationHandlerContext context, AppAccessRequirement requirement, RouteData routeData, InstanceContext instanceContext)
+        {
             XacmlJsonRequest request = new XacmlJsonRequest();
             request.AccessSubject = new List<XacmlJsonCategory>();
             request.Action = new List<XacmlJsonCategory>();
             request.Resource = new List<XacmlJsonCategory>();
 
+            AppRouteValues route = GetAppRouteValues(routeData);
+
+            request.AccessSubject.Add(CreateSubjectCategory(context.User.Claims));
+            request.Action.Add(CreateActionCategory(requirement.ActionType));
+
+            XacmlJsonCategory resourceCategory = CreateResourceCategory(route.Org, route.App, route.InstanceOwnerPartyId, route.InstanceGuid, instanceContext?.TaskId);
+
+            // As in the PDP's own lookup of the instance, the end event is only used when there is no current task.
+            if (string.IsNullOrWhiteSpace(instanceContext?.TaskId) && !string.IsNullOrWhiteSpace(instanceContext?.EndEvent))
+            {
+                resourceCategory.Attribute.Add(CreateXacmlJsonAttribute(AltinnXacmlUrns.EndEvent, instanceContext.EndEvent, DefaultType, DefaultIssuer));
+            }
+
+            request.Resource.Add(resourceCategory);
+
+            XacmlJsonRequestRoot jsonRequest = new XacmlJsonRequestRoot() { Request = request };
+
+            return jsonRequest;
+        }
+
+        /// <summary>
+        /// Reads the org, app and instance identifiers from the route of a request to an app.
+        /// </summary>
+        /// <param name="routeData">The route data from a request.</param>
+        /// <returns>The values, each null when the route does not have it.</returns>
+        internal static AppRouteValues GetAppRouteValues(RouteData routeData)
+        {
             string instanceGuid = routeData.Values[ParamInstanceGuid] as string;
             string app = routeData.Values[ParamApp] as string;
             string org = routeData.Values[ParamOrg] as string;
@@ -149,13 +195,7 @@ namespace Altinn.Common.PEP.Helpers
                 }
             }
 
-            request.AccessSubject.Add(CreateSubjectCategory(context.User.Claims));
-            request.Action.Add(CreateActionCategory(requirement.ActionType));
-            request.Resource.Add(CreateResourceCategory(org, app, instanceOwnerPartyId, instanceGuid, null));
-
-            XacmlJsonRequestRoot jsonRequest = new XacmlJsonRequestRoot() { Request = request };
-
-            return jsonRequest;
+            return new AppRouteValues(org, app, instanceOwnerPartyId, instanceGuid);
         }
 
         /// <summary>

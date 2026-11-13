@@ -2,9 +2,12 @@
 
 using Altinn.Authorization.ABAC.Xacml;
 using Altinn.Authorization.ABAC.Xacml.JsonProfile;
+using Altinn.Common.PEP.Authorization;
 using Altinn.Common.PEP.Constants;
 using Altinn.Common.PEP.Helpers;
 using Altinn.Common.PEP.Models;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Routing;
 
 namespace Altinn.Authorization.PEP.Tests
 {
@@ -15,6 +18,7 @@ namespace Altinn.Authorization.PEP.Tests
         private const string App = "App";
         private const string ActionType = "read";
         private const int PartyId = 1000;
+        private const string InstanceGuid = "0f8b3f8c-9d0e-4bb4-a6a4-1a2b3c4d5e6f";
         private const string PolicyObligationMinAuthnLevel = "urn:altinn:minimum-authenticationlevel";
         private const string PolicyObligationMinAuthnLevelSystemUser = "urn:altinn:minimum-authenticationlevel-systemuser";
 
@@ -36,7 +40,46 @@ namespace Altinn.Authorization.PEP.Tests
         }
 
         /// <summary>
-        /// Test case: Send attributes and creates request out of it 
+        /// Test case: Create a request for an app route with the process state of the instance
+        /// Expected: The task is added when there is one, the end event only when there is no task
+        /// </summary>
+        [Theory]
+        [InlineData("Task_1", null, "Task_1", null)]
+        [InlineData(null, "EndEvent_1", null, "EndEvent_1")]
+        [InlineData("Task_1", "EndEvent_1", "Task_1", null)]
+        [InlineData("", "", null, null)]
+        [InlineData(null, null, null, null)]
+        public void CreateDecisionRequest_AppRouteWithInstanceContext_AddsTaskOrEndEvent(string taskId, string endEvent, string expectedTask, string expectedEndEvent)
+        {
+            // Arrange & Act
+            XacmlJsonRequestRoot requestRoot = DecisionHelper.CreateDecisionRequest(CreateAppAuthorizationHandlerContext(), new AppAccessRequirement(ActionType), CreateAppRouteData(), new InstanceContext(PartyId, $"{Org}/{App}", taskId, endEvent));
+            List<XacmlJsonAttribute> resource = Assert.Single(requestRoot.Request.Resource).Attribute;
+
+            // Assert
+            Assert.Equal(expectedTask, resource.SingleOrDefault(a => a.AttributeId == AltinnXacmlUrns.TaskId)?.Value);
+            Assert.Equal(expectedEndEvent, resource.SingleOrDefault(a => a.AttributeId == AltinnXacmlUrns.EndEvent)?.Value);
+            Assert.Equal(PartyId.ToString(), resource.Single(a => a.AttributeId == AltinnXacmlUrns.PartyId).Value);
+            Assert.Equal($"{PartyId}/{InstanceGuid}", resource.Single(a => a.AttributeId == AltinnXacmlUrns.InstanceId).Value);
+        }
+
+        /// <summary>
+        /// Test case: Create a request for an app route without the process state of the instance
+        /// Expected: The resource is the same as before, without task or end event, so the PDP looks the instance up itself
+        /// </summary>
+        [Fact]
+        public void CreateDecisionRequest_AppRouteWithoutInstanceContext_ReturnsResourceWithoutTaskOrEndEvent()
+        {
+            // Arrange & Act
+            XacmlJsonRequestRoot requestRoot = DecisionHelper.CreateDecisionRequest(CreateAppAuthorizationHandlerContext(), new AppAccessRequirement(ActionType), CreateAppRouteData());
+
+            // Assert
+            Assert.Equal(
+                [AltinnXacmlUrns.PartyId, AltinnXacmlUrns.InstanceId, AltinnXacmlUrns.OrgId, AltinnXacmlUrns.AppId],
+                Assert.Single(requestRoot.Request.Resource).Attribute.Select(a => a.AttributeId));
+        }
+
+        /// <summary>
+        /// Test case: Send attributes and creates request out of it
         /// Expected: Only valid urn values sent in will be created to attributes
         /// </summary>
         [Fact]
@@ -443,6 +486,22 @@ namespace Altinn.Authorization.PEP.Tests
 
             // Assert
             Assert.False(result);
+        }
+
+        private AuthorizationHandlerContext CreateAppAuthorizationHandlerContext()
+        {
+            return new AuthorizationHandlerContext([new AppAccessRequirement(ActionType)], CreateUserClaims(false), null);
+        }
+
+        private static RouteData CreateAppRouteData()
+        {
+            return new RouteData(new RouteValueDictionary
+            {
+                { "org", Org },
+                { "app", App },
+                { "instanceOwnerPartyId", PartyId.ToString() },
+                { "instanceGuid", InstanceGuid },
+            });
         }
 
         private ClaimsPrincipal CreateUserClaims(bool addExtraClaim, string org = null)

@@ -1,9 +1,11 @@
 ﻿using Altinn.Authorization.ABAC.Xacml.JsonProfile;
 using Altinn.Common.PEP.Helpers;
 using Altinn.Common.PEP.Interfaces;
+using Altinn.Common.PEP.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace Altinn.Common.PEP.Authorization
@@ -46,8 +48,10 @@ namespace Altinn.Common.PEP.Authorization
         protected override async Task HandleRequirementAsync(AuthorizationHandlerContext context, AppAccessRequirement requirement)
         {
             HttpContext httpContext = _httpContextAccessor.HttpContext;
+            RouteData routeData = httpContext.GetRouteData();
 
-            XacmlJsonRequestRoot request = DecisionHelper.CreateDecisionRequest(context, requirement, _httpContextAccessor.HttpContext.GetRouteData());
+            InstanceContext instanceContext = await GetInstanceContext(httpContext, routeData);
+            XacmlJsonRequestRoot request = DecisionHelper.CreateDecisionRequest(context, requirement, routeData, instanceContext);
 
             XacmlJsonResponse response = await _pdp.GetDecisionForRequest(request, httpContext.RequestAborted);
 
@@ -62,6 +66,47 @@ namespace Altinn.Common.PEP.Authorization
             }
 
             context.Succeed(requirement);
+        }
+
+        /// <summary>
+        /// Gets the process state of the instance in the route from the host's <see cref="IInstanceContextProvider"/>.
+        /// The provider is resolved per request, because this handler is often registered as a singleton.
+        /// </summary>
+        /// <param name="httpContext">The current <see cref="HttpContext"/>.</param>
+        /// <param name="routeData">The route data from the request.</param>
+        /// <returns>
+        /// The instance context, or null when there is no provider, no instance in the route, nothing known about it,
+        /// or an instance that does not belong to the party and app in the route.
+        /// </returns>
+        private static async Task<InstanceContext> GetInstanceContext(HttpContext httpContext, RouteData routeData)
+        {
+            IInstanceContextProvider provider = httpContext.RequestServices?.GetService<IInstanceContextProvider>();
+            if (provider == null)
+            {
+                return null;
+            }
+
+            DecisionHelper.AppRouteValues route = DecisionHelper.GetAppRouteValues(routeData);
+            if (string.IsNullOrEmpty(route.Org)
+                || string.IsNullOrEmpty(route.App)
+                || !int.TryParse(route.InstanceOwnerPartyId, out int instanceOwnerPartyId)
+                || !Guid.TryParse(route.InstanceGuid, out Guid instanceGuid))
+            {
+                return null;
+            }
+
+            InstanceContext instanceContext = await provider.GetInstanceContext(route.Org, route.App, instanceOwnerPartyId, instanceGuid, httpContext.RequestAborted);
+
+            // With a task or end event the PDP does not look the instance up, so it no longer checks that the instance
+            // belongs to the party and app in the route. When it does not, leave the lookup, and the denial, to the PDP.
+            if (instanceContext == null
+                || instanceContext.InstanceOwnerPartyId != instanceOwnerPartyId
+                || instanceContext.AppId != $"{route.Org}/{route.App}")
+            {
+                return null;
+            }
+
+            return instanceContext;
         }
     }
 }

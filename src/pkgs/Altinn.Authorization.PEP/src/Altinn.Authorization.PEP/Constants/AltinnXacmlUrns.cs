@@ -61,6 +61,11 @@
         public const string TaskId = "urn:altinn:task";
 
         /// <summary>
+        /// Get the value end event id
+        /// </summary>
+        public const string EndEvent = "urn:altinn:end-event";
+
+        /// <summary>
         /// Get the value resourceId
         /// </summary>
         public const string ResourceId = "urn:altinn:resource";
